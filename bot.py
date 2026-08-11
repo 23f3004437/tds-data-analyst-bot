@@ -15,7 +15,7 @@ from typing import Any
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.responses import PlainTextResponse
 from openai import OpenAI
 
@@ -28,19 +28,27 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN", "").strip()
+
 AIPIPE_BASE_URL = os.getenv(
     "AIPIPE_BASE_URL",
     "https://aipipe.org/openai/v1",
 ).strip()
-AIPIPE_MODEL = os.getenv("AIPIPE_MODEL", "gpt-5-nano").strip()
-BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
+
+AIPIPE_MODEL = os.getenv(
+    "AIPIPE_MODEL",
+    "gpt-5-mini",
+).strip()
+
+BASE_URL = os.getenv(
+    "BASE_URL",
+    "http://localhost:8000",
+).rstrip("/")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing from .env")
+    raise RuntimeError("BOT_TOKEN is missing from environment variables")
 
 if not AIPIPE_TOKEN:
-    raise RuntimeError("AIPIPE_TOKEN is missing from .env")
-
+    raise RuntimeError("AIPIPE_TOKEN is missing from environment variables")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 LOG_FILE = Path("run.jsonl")
@@ -94,6 +102,12 @@ def health() -> dict[str, Any]:
     }
 
 
+# Allows UptimeRobot free HTTP monitor to check /health using HEAD
+@app.head("/health")
+def health_head():
+    return Response(status_code=200)
+
+
 @app.get("/run.jsonl", response_class=PlainTextResponse)
 def run_log() -> str:
     if not LOG_FILE.exists():
@@ -120,6 +134,7 @@ def run_python(code: str) -> str:
 
     The environment deliberately includes common analysis libraries.
     """
+
     output_buffer = io.StringIO()
 
     tool_globals: dict[str, Any] = {
@@ -180,7 +195,12 @@ def remove_code_fences(text: str) -> str:
         cleaned,
         flags=re.IGNORECASE,
     )
-    cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    cleaned = re.sub(
+        r"\s*```$",
+        "",
+        cleaned,
+    )
 
     return cleaned.strip()
 
@@ -205,12 +225,15 @@ def first_balanced_json_object(text: str) -> str | None:
                 escaped = True
             elif character == '"':
                 inside_string = False
+
             continue
 
         if character == '"':
             inside_string = True
+
         elif character == "{":
             depth += 1
+
         elif character == "}":
             depth -= 1
 
@@ -231,14 +254,21 @@ def normalise_model_reply(raw_reply: str) -> dict[str, Any]:
             parsed = json.loads(cleaned)
         else:
             parsed = json.loads(candidate)
+
     except (json.JSONDecodeError, TypeError):
-        parsed = {"answer": cleaned or "Unable to produce an answer"}
+        parsed = {
+            "answer": cleaned or "Unable to produce an answer"
+        }
 
     if not isinstance(parsed, dict):
-        parsed = {"answer": parsed}
+        parsed = {
+            "answer": parsed
+        }
 
     if "answer" not in parsed:
-        parsed = {"answer": parsed}
+        parsed = {
+            "answer": parsed
+        }
 
     parsed["log_url"] = f"{BASE_URL}/run.jsonl"
 
@@ -253,6 +283,7 @@ SYSTEM_PROMPT = """
 You are a careful data-analysis agent responding through Telegram.
 
 Rules:
+
 1. Answer the user's latest message. Earlier messages are context for a
    multi-turn question.
 2. Reply with exactly one JSON object and nothing else.
@@ -274,22 +305,39 @@ Rules:
 """
 
 
-def build_messages(chat_id: int, current_message: str) -> list[dict[str, str]]:
+def build_messages(
+    chat_id: int,
+    current_message: str,
+) -> list[dict[str, str]]:
+
     with history_lock:
         previous = list(chat_histories[chat_id])
 
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT,
+        },
         *previous,
-        {"role": "user", "content": current_message},
+        {
+            "role": "user",
+            "content": current_message,
+        },
     ]
 
 
-def solve_question(chat_id: int, question: str) -> dict[str, Any]:
+def solve_question(
+    chat_id: int,
+    question: str,
+) -> dict[str, Any]:
+
     started_at = time.monotonic()
     deadline = started_at + QUESTION_TIME_LIMIT
 
-    messages: list[dict[str, Any]] = build_messages(chat_id, question)
+    messages: list[dict[str, Any]] = build_messages(
+        chat_id,
+        question,
+    )
 
     write_log(
         {
@@ -320,7 +368,10 @@ def solve_question(chat_id: int, question: str) -> dict[str, Any]:
                 messages=messages,
             )
 
-            final_text = response.choices[0].message.content or ""
+            final_text = (
+                response.choices[0].message.content or ""
+            )
+
             break
 
         response = client.chat.completions.create(
@@ -331,7 +382,11 @@ def solve_question(chat_id: int, question: str) -> dict[str, Any]:
         )
 
         assistant_message = response.choices[0].message
-        assistant_dict = assistant_message.model_dump(exclude_none=True)
+
+        assistant_dict = assistant_message.model_dump(
+            exclude_none=True
+        )
+
         messages.append(assistant_dict)
 
         tool_calls = assistant_message.tool_calls or []
@@ -347,10 +402,17 @@ def solve_question(chat_id: int, question: str) -> dict[str, Any]:
             if tool_call.function.name != "run_python":
                 tool_output = "Unknown tool requested."
                 tool_code = ""
+
             else:
                 try:
-                    arguments = json.loads(tool_call.function.arguments)
-                    tool_code = str(arguments.get("code", ""))
+                    arguments = json.loads(
+                        tool_call.function.arguments
+                    )
+
+                    tool_code = str(
+                        arguments.get("code", "")
+                    )
+
                 except json.JSONDecodeError:
                     tool_code = ""
                     tool_output = "Invalid tool arguments."
@@ -392,11 +454,17 @@ def solve_question(chat_id: int, question: str) -> dict[str, Any]:
             model=AIPIPE_MODEL,
             messages=messages,
         )
-        final_text = response.choices[0].message.content or ""
+
+        final_text = (
+            response.choices[0].message.content or ""
+        )
 
     final_reply = normalise_model_reply(final_text)
 
-    elapsed = round(time.monotonic() - started_at, 3)
+    elapsed = round(
+        time.monotonic() - started_at,
+        3,
+    )
 
     write_log(
         {
@@ -410,14 +478,27 @@ def solve_question(chat_id: int, question: str) -> dict[str, Any]:
 
     with history_lock:
         history = chat_histories[chat_id]
-        history.append({"role": "user", "content": question})
+
+        history.append(
+            {
+                "role": "user",
+                "content": question,
+            }
+        )
+
         history.append(
             {
                 "role": "assistant",
-                "content": json.dumps(final_reply, ensure_ascii=False),
+                "content": json.dumps(
+                    final_reply,
+                    ensure_ascii=False,
+                ),
             }
         )
-        chat_histories[chat_id] = history[-MAX_HISTORY_MESSAGES:]
+
+        chat_histories[chat_id] = (
+            history[-MAX_HISTORY_MESSAGES:]
+        )
 
     return final_reply
 
@@ -431,22 +512,30 @@ def telegram_request(
     payload: dict[str, Any] | None = None,
     timeout: int = 60,
 ) -> dict[str, Any]:
+
     response = requests.post(
         f"{TELEGRAM_API}/{method}",
         json=payload or {},
         timeout=timeout,
     )
+
     response.raise_for_status()
 
     data = response.json()
 
     if not data.get("ok"):
-        raise RuntimeError(f"Telegram API error: {data}")
+        raise RuntimeError(
+            f"Telegram API error: {data}"
+        )
 
     return data
 
 
-def send_telegram_message(chat_id: int, reply: dict[str, Any]) -> None:
+def send_telegram_message(
+    chat_id: int,
+    reply: dict[str, Any],
+) -> None:
+
     text = json.dumps(
         reply,
         ensure_ascii=False,
@@ -463,9 +552,17 @@ def send_telegram_message(chat_id: int, reply: dict[str, Any]) -> None:
     )
 
 
-def handle_message(chat_id: int, text: str) -> None:
+def handle_message(
+    chat_id: int,
+    text: str,
+) -> None:
+
     try:
-        reply = solve_question(chat_id, text)
+        reply = solve_question(
+            chat_id,
+            text,
+        )
+
     except Exception:
         write_log(
             {
@@ -482,7 +579,11 @@ def handle_message(chat_id: int, text: str) -> None:
         }
 
     try:
-        send_telegram_message(chat_id, reply)
+        send_telegram_message(
+            chat_id,
+            reply,
+        )
+
     except Exception:
         write_log(
             {
@@ -496,7 +597,11 @@ def handle_message(chat_id: int, text: str) -> None:
 def polling_loop() -> None:
     offset: int | None = None
 
-    write_log({"event": "polling_started"})
+    write_log(
+        {
+            "event": "polling_started"
+        }
+    )
 
     while True:
         try:
@@ -514,22 +619,41 @@ def polling_loop() -> None:
                 timeout=60,
             )
 
-            for update in response.get("result", []):
-                offset = int(update["update_id"]) + 1
+            for update in response.get(
+                "result",
+                [],
+            ):
+                offset = (
+                    int(update["update_id"]) + 1
+                )
 
-                message = update.get("message") or {}
+                message = (
+                    update.get("message") or {}
+                )
+
                 text = message.get("text")
-                chat = message.get("chat") or {}
+
+                chat = (
+                    message.get("chat") or {}
+                )
+
                 chat_id = chat.get("id")
 
-                if not isinstance(text, str) or chat_id is None:
+                if (
+                    not isinstance(text, str)
+                    or chat_id is None
+                ):
                     continue
 
                 worker = threading.Thread(
                     target=handle_message,
-                    args=(int(chat_id), text),
+                    args=(
+                        int(chat_id),
+                        text,
+                    ),
                     daemon=True,
                 )
+
                 worker.start()
 
         except Exception:
@@ -539,6 +663,7 @@ def polling_loop() -> None:
                     "error": traceback.format_exc(),
                 }
             )
+
             time.sleep(5)
 
 
@@ -558,6 +683,7 @@ def keep_awake_loop() -> None:
                 f"{BASE_URL}/health",
                 timeout=30,
             )
+
         except Exception as error:
             write_log(
                 {
@@ -567,16 +693,23 @@ def keep_awake_loop() -> None:
             )
 
 
+# -------------------------------------------------------------------
+# Startup
+# -------------------------------------------------------------------
+
 @app.on_event("startup")
 def startup() -> None:
+
     polling_thread = threading.Thread(
         target=polling_loop,
         daemon=True,
     )
+
     polling_thread.start()
 
     keep_awake_thread = threading.Thread(
         target=keep_awake_loop,
         daemon=True,
     )
+
     keep_awake_thread.start()
