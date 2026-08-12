@@ -46,10 +46,14 @@ BASE_URL = os.getenv(
 ).rstrip("/")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing from environment variables")
+    raise RuntimeError(
+        "BOT_TOKEN is missing from environment variables"
+    )
 
 if not AIPIPE_TOKEN:
-    raise RuntimeError("AIPIPE_TOKEN is missing from environment variables")
+    raise RuntimeError(
+        "AIPIPE_TOKEN is missing from environment variables"
+    )
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 LOG_FILE = Path("run.jsonl")
@@ -57,7 +61,7 @@ LOG_FILE = Path("run.jsonl")
 MAX_HISTORY_MESSAGES = 20
 
 # Professor allows 5 minutes total.
-# Keep the agent comfortably inside that.
+# Keep our processing safely below that.
 MAX_AGENT_STEPS = 6
 QUESTION_TIME_LIMIT = 210
 PYTHON_TOOL_TIME_LIMIT = 45
@@ -72,9 +76,14 @@ client = OpenAI(
     max_retries=0,
 )
 
-app = FastAPI(title="TDS Data Analyst Telegram Bot")
+app = FastAPI(
+    title="TDS Data Analyst Telegram Bot"
+)
 
-chat_histories: dict[int, list[dict[str, str]]] = defaultdict(list)
+chat_histories: dict[
+    int,
+    list[dict[str, str]],
+] = defaultdict(list)
 
 history_lock = threading.Lock()
 log_lock = threading.Lock()
@@ -85,17 +94,26 @@ log_lock = threading.Lock()
 # -------------------------------------------------------------------
 
 def utc_timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
 
 
-def write_log(event: dict[str, Any]) -> None:
+def write_log(
+    event: dict[str, Any],
+) -> None:
+
     record = {
         "timestamp": utc_timestamp(),
         **event,
     }
 
     with log_lock:
-        with LOG_FILE.open("a", encoding="utf-8") as file:
+        with LOG_FILE.open(
+            "a",
+            encoding="utf-8",
+        ) as file:
+
             file.write(
                 json.dumps(
                     record,
@@ -121,7 +139,9 @@ def health() -> dict[str, Any]:
 # Allows UptimeRobot free monitor to use HEAD.
 @app.head("/health")
 def health_head() -> Response:
-    return Response(status_code=200)
+    return Response(
+        status_code=200
+    )
 
 
 @app.get(
@@ -129,6 +149,7 @@ def health_head() -> Response:
     response_class=PlainTextResponse,
 )
 def run_log() -> str:
+
     if not LOG_FILE.exists():
         return ""
 
@@ -141,7 +162,9 @@ def run_log() -> str:
 def root() -> dict[str, Any]:
     return {
         "ok": True,
-        "service": "TDS Data Analyst Telegram Bot",
+        "service": (
+            "TDS Data Analyst Telegram Bot"
+        ),
     }
 
 
@@ -149,13 +172,14 @@ def root() -> dict[str, Any]:
 # Python analysis tool
 # -------------------------------------------------------------------
 
-def run_python(code: str) -> str:
+def run_python(
+    code: str,
+) -> str:
     """
     Execute model-generated Python in a separate process.
 
-    This prevents slow API calls, excessive request loops,
-    or accidental infinite loops from consuming the full
-    grading window.
+    This prevents slow APIs, large request loops, or accidental
+    infinite loops from consuming the full grading window.
     """
 
     temp_path: str | None = None
@@ -169,20 +193,34 @@ def run_python(code: str) -> str:
         ) as temp_file:
 
             temp_file.write(code)
-            temp_path = temp_file.name
+
+            temp_path = (
+                temp_file.name
+            )
 
         completed = subprocess.run(
-            [sys.executable, temp_path],
+            [
+                sys.executable,
+                temp_path,
+            ],
             capture_output=True,
             text=True,
             timeout=PYTHON_TOOL_TIME_LIMIT,
         )
 
-        stdout = (completed.stdout or "").strip()
-        stderr = (completed.stderr or "").strip()
+        stdout = (
+            completed.stdout
+            or ""
+        ).strip()
+
+        stderr = (
+            completed.stderr
+            or ""
+        ).strip()
 
         if completed.returncode == 0:
             output = stdout
+
         else:
             output = (
                 stdout
@@ -196,29 +234,38 @@ def run_python(code: str) -> str:
                 "with no printed output."
             )
 
-        return output[-MAX_TOOL_OUTPUT:]
+        return output[
+            -MAX_TOOL_OUTPUT:
+        ]
 
     except subprocess.TimeoutExpired:
+
         return (
             f"Python tool timed out after "
             f"{PYTHON_TOOL_TIME_LIMIT} seconds. "
             "Do not repeat the same slow request pattern. "
             "Immediately use a smaller filtered request, "
-            "a bulk request, another endpoint, or another "
-            "appropriate reliable source."
+            "a bulk request, another endpoint, downloadable "
+            "dataset, or another appropriate reliable source."
         )
 
     except Exception:
+
         return traceback.format_exc()[
             -MAX_TOOL_OUTPUT:
         ]
 
     finally:
+
         if temp_path:
+
             try:
-                Path(temp_path).unlink(
+                Path(
+                    temp_path
+                ).unlink(
                     missing_ok=True
                 )
+
             except Exception:
                 pass
 
@@ -243,10 +290,14 @@ TOOLS = [
                 "properties": {
                     "code": {
                         "type": "string",
-                        "description": "Complete Python code to execute.",
+                        "description": (
+                            "Complete Python code to execute."
+                        ),
                     }
                 },
-                "required": ["code"],
+                "required": [
+                    "code"
+                ],
             },
         },
     }
@@ -257,7 +308,10 @@ TOOLS = [
 # JSON response handling
 # -------------------------------------------------------------------
 
-def remove_code_fences(text: str) -> str:
+def remove_code_fences(
+    text: str,
+) -> str:
+
     cleaned = text.strip()
 
     cleaned = re.sub(
@@ -293,9 +347,13 @@ def first_balanced_json_object(
         start,
         len(text),
     ):
-        character = text[index]
+
+        character = (
+            text[index]
+        )
 
         if inside_string:
+
             if escaped:
                 escaped = False
 
@@ -314,9 +372,11 @@ def first_balanced_json_object(
             depth += 1
 
         elif character == "}":
+
             depth -= 1
 
             if depth == 0:
+
                 return text[
                     start:index + 1
                 ]
@@ -332,22 +392,31 @@ def normalise_model_reply(
         raw_reply
     )
 
-    candidate = first_balanced_json_object(
-        cleaned
+    candidate = (
+        first_balanced_json_object(
+            cleaned
+        )
     )
 
     parsed: Any
 
     try:
+
         if candidate is None:
-            parsed = json.loads(cleaned)
+            parsed = json.loads(
+                cleaned
+            )
+
         else:
-            parsed = json.loads(candidate)
+            parsed = json.loads(
+                candidate
+            )
 
     except (
         json.JSONDecodeError,
         TypeError,
     ):
+
         parsed = {
             "answer": (
                 cleaned
@@ -357,18 +426,78 @@ def normalise_model_reply(
         }
 
     if (
-        isinstance(parsed, dict)
+        isinstance(
+            parsed,
+            dict,
+        )
         and
         "answer" in parsed
     ):
-        answer = parsed["answer"]
+
+        answer = (
+            parsed["answer"]
+        )
+
     else:
+
         answer = parsed
 
     return {
         "answer": answer,
-        "log_url": f"{BASE_URL}/run.jsonl",
+        "log_url": (
+            f"{BASE_URL}/run.jsonl"
+        ),
     }
+
+
+# -------------------------------------------------------------------
+# LLM helper
+# -------------------------------------------------------------------
+
+def create_model_response(
+    messages: list[dict[str, Any]],
+    use_tools: bool,
+):
+    """
+    Make one model request.
+
+    GPT-5.6 Sol through Chat Completions requires reasoning_effort='none'
+    when function tools are enabled.
+    """
+
+    request_kwargs: dict[str, Any] = {
+        "model": AIPIPE_MODEL,
+        "messages": messages,
+    }
+
+    if use_tools:
+
+        request_kwargs[
+            "tools"
+        ] = TOOLS
+
+        request_kwargs[
+            "tool_choice"
+        ] = "auto"
+
+        # GPT-5.6 Sol + function tools + Chat Completions
+        # requires reasoning_effort="none".
+        if AIPIPE_MODEL.startswith(
+            "gpt-5.6"
+        ):
+
+            request_kwargs[
+                "reasoning_effort"
+            ] = "none"
+
+    return (
+        client
+        .chat
+        .completions
+        .create(
+            **request_kwargs
+        )
+    )
 
 
 # -------------------------------------------------------------------
@@ -414,83 +543,87 @@ ANALYSIS RULES
     percentages, totals or comparisons, calculate every relevant candidate
     and select the result programmatically.
 
+11. Prefer one run_python tool call per reasoning step. Put related
+    downloading, filtering and calculation into the same Python program
+    when practical.
+
 NETWORK AND DATA RETRIEVAL RULES
 
-11. Prefer one targeted, filtered or bulk request over many sequential
+12. Prefer one targeted, filtered or bulk request over many sequential
     requests.
 
-12. Do not make a separate network request for every country, year, row,
+13. Do not make a separate network request for every country, year, row,
     category or observation when the data can be fetched together.
 
-13. Request only the data needed to answer the question whenever the source
+14. Request only the data needed to answer the question whenever the source
     supports filtering, field selection, pagination or query parameters.
 
-14. Use HTTP request timeouts of roughly 10 to 15 seconds.
+15. Use HTTP request timeouts of roughly 10 to 15 seconds.
 
-15. If a network request fails or times out once, do not repeat the
+16. If a network request fails or times out once, do not repeat the
     identical request. Immediately change strategy.
 
-16. A changed strategy can include a smaller query, a bulk endpoint, another
+17. A changed strategy can include a smaller query, a bulk endpoint, another
     API endpoint, another file format, a downloadable dataset, another page
     from the same organization, or another reliable source when appropriate.
 
-17. Do not create loops that may perform dozens of slow HTTP requests.
+18. Do not create loops that may perform dozens of slow HTTP requests.
 
-18. If an API appears unreliable, prefer downloading the relevant dataset
+19. If an API appears unreliable, prefer downloading the relevant dataset
     once and processing it locally when practical.
 
 SOURCE ACCURACY RULES
 
-19. When the user explicitly names a source, organization, dataset or
+20. When the user explicitly names a source, organization, dataset or
     indicator, use that source whenever reasonably possible.
 
-20. Do not silently substitute another organization's data when the user
+21. Do not silently substitute another organization's data when the user
     explicitly requires a particular source.
 
-21. If one endpoint from the required organization fails, first try another
+22. If one endpoint from the required organization fails, first try another
     official endpoint, API, download, file or interface from the same
     organization.
 
-22. Verify dimensions that matter to the question, such as country, year,
+23. Verify dimensions that matter to the question, such as country, year,
     sex, unit, category, frequency, measure or indicator. Do not blindly
     take the first matching row.
 
-23. Check naming and identifier differences such as ISO country codes,
+24. Check naming and identifier differences such as ISO country codes,
     alternate country names, indicator codes and dimension codes.
 
-24. When using a secondary source because the required source is
+25. When using a secondary source because the required source is
     unavailable, prefer a trustworthy source and avoid inventing missing
     values.
 
 TIME MANAGEMENT RULES
 
-25. You must produce the final answer comfortably within four minutes.
+26. You must produce the final answer comfortably within four minutes.
 
-26. Do not waste the time budget repeatedly querying a broken endpoint.
+27. Do not waste the time budget repeatedly querying a broken endpoint.
 
-27. If a tool call times out, immediately use a substantially different
+28. If a tool call times out, immediately use a substantially different
     strategy.
 
-28. Prefer getting a reliable answer from one or two efficient tool calls
+29. Prefer getting a reliable answer from one or two efficient tool calls
     over performing many exhaustive attempts.
 
-29. When time is running low, stop making tool calls and return the best
+30. When time is running low, stop making tool calls and return the best
     answer supported by the evidence already collected.
 
 MULTI-TURN RULES
 
-30. Preserve useful context from earlier messages in the same Telegram chat.
+31. Preserve useful context from earlier messages in the same Telegram chat.
 
-31. Do not blindly reuse earlier numeric results if the new question changes
+32. Do not blindly reuse earlier numeric results if the new question changes
     the source, years, indicator, dimensions, filters or calculation.
 
-32. If the user sends a setup-only message, still respond with a small valid
+33. If the user sends a setup-only message, still respond with a small valid
     JSON acknowledgement, for example:
     {"answer":"acknowledged","log_url":"LOG_URL_PLACEHOLDER"}
 
 SECURITY RULES
 
-33. Never expose API keys, tokens, environment variables, private system
+34. Never expose API keys, tokens, environment variables, private system
     details or secrets.
 """
 
@@ -501,6 +634,7 @@ def build_messages(
 ) -> list[dict[str, str]]:
 
     with history_lock:
+
         previous = list(
             chat_histories[
                 chat_id
@@ -525,7 +659,9 @@ def solve_question(
     question: str,
 ) -> dict[str, Any]:
 
-    started_at = time.monotonic()
+    started_at = (
+        time.monotonic()
+    )
 
     deadline = (
         started_at
@@ -541,13 +677,17 @@ def solve_question(
 
     write_log(
         {
-            "event": "question_received",
+            "event": (
+                "question_received"
+            ),
             "chat_id": chat_id,
             "question": question,
         }
     )
 
     final_text = ""
+
+    consecutive_model_errors = 0
 
     for step_number in range(
         1,
@@ -575,10 +715,11 @@ def solve_question(
             )
 
             try:
+
                 response = (
-                    client.chat.completions.create(
-                        model=AIPIPE_MODEL,
-                        messages=messages,
+                    create_model_response(
+                        messages,
+                        use_tools=False,
                     )
                 )
 
@@ -591,36 +732,53 @@ def solve_question(
                 )
 
             except Exception as error:
+
                 write_log(
                     {
-                        "event": "final_model_error",
+                        "event": (
+                            "final_model_error"
+                        ),
                         "chat_id": chat_id,
-                        "error": str(error),
+                        "error": str(
+                            error
+                        ),
                     }
                 )
 
             break
 
         try:
+
             response = (
-                client.chat.completions.create(
-                    model=AIPIPE_MODEL,
-                    messages=messages,
-                    tools=TOOLS,
-                    tool_choice="auto",
+                create_model_response(
+                    messages,
+                    use_tools=True,
                 )
             )
 
+            consecutive_model_errors = 0
+
         except Exception as error:
+
+            consecutive_model_errors += 1
 
             write_log(
                 {
-                    "event": "model_request_error",
+                    "event": (
+                        "model_request_error"
+                    ),
                     "chat_id": chat_id,
                     "step": step_number,
-                    "error": str(error),
+                    "error": str(
+                        error
+                    ),
                 }
             )
+
+            # Do not waste all six steps repeating
+            # the same upstream/model error.
+            if consecutive_model_errors >= 2:
+                break
 
             continue
 
@@ -631,7 +789,8 @@ def solve_question(
         )
 
         assistant_dict = (
-            assistant_message.model_dump(
+            assistant_message
+            .model_dump(
                 exclude_none=True
             )
         )
@@ -641,95 +800,123 @@ def solve_question(
         )
 
         tool_calls = (
-            assistant_message.tool_calls
+            assistant_message
+            .tool_calls
             or []
         )
 
         if not tool_calls:
+
             final_text = (
-                assistant_message.content
+                assistant_message
+                .content
                 or ""
             )
+
             break
 
-        # Execute only the first tool call from each model step.
-        # This prevents one model response from launching several
-        # potentially slow tool calls.
-        tool_call = tool_calls[0]
+        # Handle every tool call returned by the model.
+        # Usually there should only be one because the
+        # system prompt requests one tool call per step.
+        for tool_call in tool_calls:
 
-        remaining = (
-            deadline
-            - time.monotonic()
-        )
-
-        if remaining <= 40:
-            continue
-
-        tool_code = ""
-        tool_output = ""
-
-        if (
-            tool_call
-            .function
-            .name
-            != "run_python"
-        ):
-            tool_output = (
-                "Unknown tool requested."
+            remaining = (
+                deadline
+                - time.monotonic()
             )
 
-        else:
-            try:
-                arguments = json.loads(
-                    tool_call
-                    .function
-                    .arguments
-                )
+            tool_code = ""
+            tool_output = ""
 
-                tool_code = str(
-                    arguments.get(
-                        "code",
-                        "",
-                    )
-                )
+            if remaining <= 40:
 
-            except json.JSONDecodeError:
                 tool_output = (
-                    "Invalid tool arguments."
+                    "Tool execution skipped because the "
+                    "time limit is approaching. Use the "
+                    "evidence already collected and return "
+                    "the final answer."
                 )
 
-            if tool_code:
+            elif (
+                tool_call
+                .function
+                .name
+                != "run_python"
+            ):
+
                 tool_output = (
-                    run_python(
-                        tool_code
-                    )
+                    "Unknown tool requested."
                 )
 
-        write_log(
-            {
-                "event": "tool_call",
-                "chat_id": chat_id,
-                "step": step_number,
-                "tool": (
-                    tool_call
-                    .function
-                    .name
-                ),
-                "code": tool_code,
-                "output": tool_output,
-            }
-        )
+            else:
 
-        messages.append(
-            {
-                "role": "tool",
-                "tool_call_id": (
-                    tool_call.id
-                ),
-                "content": tool_output,
-            }
-        )
+                try:
 
+                    arguments = (
+                        json.loads(
+                            tool_call
+                            .function
+                            .arguments
+                        )
+                    )
+
+                    tool_code = str(
+                        arguments.get(
+                            "code",
+                            "",
+                        )
+                    )
+
+                except json.JSONDecodeError:
+
+                    tool_output = (
+                        "Invalid tool arguments."
+                    )
+
+                if tool_code:
+
+                    tool_output = (
+                        run_python(
+                            tool_code
+                        )
+                    )
+
+            write_log(
+                {
+                    "event": (
+                        "tool_call"
+                    ),
+                    "chat_id": chat_id,
+                    "step": (
+                        step_number
+                    ),
+                    "tool": (
+                        tool_call
+                        .function
+                        .name
+                    ),
+                    "code": tool_code,
+                    "output": (
+                        tool_output
+                    ),
+                }
+            )
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": (
+                        tool_call.id
+                    ),
+                    "content": (
+                        tool_output
+                    ),
+                }
+            )
+
+    # If tool-enabled requests failed or the loop
+    # exhausted without a final response, make one
+    # final no-tool model call.
     if not final_text:
 
         messages.append(
@@ -744,10 +931,11 @@ def solve_question(
         )
 
         try:
+
             response = (
-                client.chat.completions.create(
-                    model=AIPIPE_MODEL,
-                    messages=messages,
+                create_model_response(
+                    messages,
+                    use_tools=False,
                 )
             )
 
@@ -763,9 +951,13 @@ def solve_question(
 
             write_log(
                 {
-                    "event": "emergency_final_error",
+                    "event": (
+                        "emergency_final_error"
+                    ),
                     "chat_id": chat_id,
-                    "error": str(error),
+                    "error": str(
+                        error
+                    ),
                 }
             )
 
@@ -792,11 +984,19 @@ def solve_question(
 
     write_log(
         {
-            "event": "final_reply",
+            "event": (
+                "final_reply"
+            ),
             "chat_id": chat_id,
-            "elapsed_seconds": elapsed,
-            "raw_model_reply": final_text,
-            "reply": final_reply,
+            "elapsed_seconds": (
+                elapsed
+            ),
+            "raw_model_reply": (
+                final_text
+            ),
+            "reply": (
+                final_reply
+            ),
         }
     )
 
@@ -855,6 +1055,7 @@ def telegram_request(
     data = response.json()
 
     if not data.get("ok"):
+
         raise RuntimeError(
             f"Telegram API error: {data}"
         )
@@ -889,38 +1090,54 @@ def handle_message(
 ) -> None:
 
     try:
+
         reply = solve_question(
             chat_id,
             text,
         )
 
     except Exception:
+
         write_log(
             {
-                "event": "handler_error",
+                "event": (
+                    "handler_error"
+                ),
                 "chat_id": chat_id,
                 "question": text,
-                "error": traceback.format_exc(),
+                "error": (
+                    traceback.format_exc()
+                ),
             }
         )
 
         reply = {
-            "answer": "internal error",
-            "log_url": f"{BASE_URL}/run.jsonl",
+            "answer": (
+                "internal error"
+            ),
+            "log_url": (
+                f"{BASE_URL}/run.jsonl"
+            ),
         }
 
     try:
+
         send_telegram_message(
             chat_id,
             reply,
         )
 
     except Exception:
+
         write_log(
             {
-                "event": "telegram_send_error",
+                "event": (
+                    "telegram_send_error"
+                ),
                 "chat_id": chat_id,
-                "error": traceback.format_exc(),
+                "error": (
+                    traceback.format_exc()
+                ),
             }
         )
 
@@ -931,13 +1148,16 @@ def polling_loop() -> None:
 
     write_log(
         {
-            "event": "polling_started"
+            "event": (
+                "polling_started"
+            )
         }
     )
 
     while True:
 
         try:
+
             payload: dict[
                 str,
                 Any
@@ -949,17 +1169,24 @@ def polling_loop() -> None:
             }
 
             if offset is not None:
-                payload["offset"] = offset
 
-            response = telegram_request(
-                "getUpdates",
-                payload,
-                timeout=60,
+                payload[
+                    "offset"
+                ] = offset
+
+            response = (
+                telegram_request(
+                    "getUpdates",
+                    payload,
+                    timeout=60,
+                )
             )
 
-            for update in response.get(
-                "result",
-                [],
+            for update in (
+                response.get(
+                    "result",
+                    [],
+                )
             ):
 
                 offset = (
@@ -1007,13 +1234,17 @@ def polling_loop() -> None:
                 ):
                     continue
 
-                worker = threading.Thread(
-                    target=handle_message,
-                    args=(
-                        int(chat_id),
-                        text,
-                    ),
-                    daemon=True,
+                worker = (
+                    threading.Thread(
+                        target=handle_message,
+                        args=(
+                            int(
+                                chat_id
+                            ),
+                            text,
+                        ),
+                        daemon=True,
+                    )
                 )
 
                 worker.start()
@@ -1022,8 +1253,12 @@ def polling_loop() -> None:
 
             write_log(
                 {
-                    "event": "polling_error",
-                    "error": traceback.format_exc(),
+                    "event": (
+                        "polling_error"
+                    ),
+                    "error": (
+                        traceback.format_exc()
+                    ),
                 }
             )
 
@@ -1046,16 +1281,22 @@ def keep_awake_loop() -> None:
             continue
 
         try:
+
             requests.get(
                 f"{BASE_URL}/health",
                 timeout=15,
             )
 
         except Exception as error:
+
             write_log(
                 {
-                    "event": "keep_awake_error",
-                    "error": str(error),
+                    "event": (
+                        "keep_awake_error"
+                    ),
+                    "error": str(
+                        error
+                    ),
                 }
             )
 
@@ -1067,16 +1308,20 @@ def keep_awake_loop() -> None:
 @app.on_event("startup")
 def startup() -> None:
 
-    polling_thread = threading.Thread(
-        target=polling_loop,
-        daemon=True,
+    polling_thread = (
+        threading.Thread(
+            target=polling_loop,
+            daemon=True,
+        )
     )
 
     polling_thread.start()
 
-    keep_awake_thread = threading.Thread(
-        target=keep_awake_loop,
-        daemon=True,
+    keep_awake_thread = (
+        threading.Thread(
+            target=keep_awake_loop,
+            daemon=True,
+        )
     )
 
     keep_awake_thread.start()
