@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import contextlib
-import io
 import json
 import os
 import re
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -54,18 +55,27 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 LOG_FILE = Path("run.jsonl")
 
 MAX_HISTORY_MESSAGES = 20
-MAX_AGENT_STEPS = 10
+
+# Professor allows 5 minutes total.
+# Keep the agent comfortably inside that.
+MAX_AGENT_STEPS = 6
 QUESTION_TIME_LIMIT = 210
-MAX_TOOL_OUTPUT = 8000
+PYTHON_TOOL_TIME_LIMIT = 45
+
+MAX_TOOL_OUTPUT = 10000
+
 
 client = OpenAI(
     api_key=AIPIPE_TOKEN,
     base_url=AIPIPE_BASE_URL,
+    timeout=40.0,
+    max_retries=0,
 )
 
 app = FastAPI(title="TDS Data Analyst Telegram Bot")
 
 chat_histories: dict[int, list[dict[str, str]]] = defaultdict(list)
+
 history_lock = threading.Lock()
 log_lock = threading.Lock()
 
@@ -86,7 +96,13 @@ def write_log(event: dict[str, Any]) -> None:
 
     with log_lock:
         with LOG_FILE.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            file.write(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
 
 
 # -------------------------------------------------------------------
@@ -102,18 +118,23 @@ def health() -> dict[str, Any]:
     }
 
 
-# Allows UptimeRobot free HTTP monitor to check /health using HEAD
+# Allows UptimeRobot free monitor to use HEAD.
 @app.head("/health")
-def health_head():
+def health_head() -> Response:
     return Response(status_code=200)
 
 
-@app.get("/run.jsonl", response_class=PlainTextResponse)
+@app.get(
+    "/run.jsonl",
+    response_class=PlainTextResponse,
+)
 def run_log() -> str:
     if not LOG_FILE.exists():
         return ""
 
-    return LOG_FILE.read_text(encoding="utf-8")
+    return LOG_FILE.read_text(
+        encoding="utf-8"
+    )
 
 
 @app.get("/")
@@ -130,31 +151,76 @@ def root() -> dict[str, Any]:
 
 def run_python(code: str) -> str:
     """
-    Execute model-generated Python and capture stdout.
+    Execute model-generated Python in a separate process.
 
-    The environment deliberately includes common analysis libraries.
+    This prevents slow API calls, excessive request loops,
+    or accidental infinite loops from consuming the full
+    grading window.
     """
 
-    output_buffer = io.StringIO()
-
-    tool_globals: dict[str, Any] = {
-        "__builtins__": __builtins__,
-    }
+    temp_path: str | None = None
 
     try:
-        with contextlib.redirect_stdout(output_buffer):
-            exec(code, tool_globals, tool_globals)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".py",
+            encoding="utf-8",
+            delete=False,
+        ) as temp_file:
 
-        output = output_buffer.getvalue().strip()
+            temp_file.write(code)
+            temp_path = temp_file.name
+
+        completed = subprocess.run(
+            [sys.executable, temp_path],
+            capture_output=True,
+            text=True,
+            timeout=PYTHON_TOOL_TIME_LIMIT,
+        )
+
+        stdout = (completed.stdout or "").strip()
+        stderr = (completed.stderr or "").strip()
+
+        if completed.returncode == 0:
+            output = stdout
+        else:
+            output = (
+                stdout
+                + "\n"
+                + stderr
+            ).strip()
 
         if not output:
-            output = "Code executed successfully with no printed output."
+            output = (
+                "Code executed successfully "
+                "with no printed output."
+            )
 
         return output[-MAX_TOOL_OUTPUT:]
 
+    except subprocess.TimeoutExpired:
+        return (
+            f"Python tool timed out after "
+            f"{PYTHON_TOOL_TIME_LIMIT} seconds. "
+            "Do not repeat the same slow request pattern. "
+            "Immediately use a smaller filtered request, "
+            "a bulk request, another endpoint, or another "
+            "appropriate reliable source."
+        )
+
     except Exception:
-        error = traceback.format_exc()
-        return error[-MAX_TOOL_OUTPUT:]
+        return traceback.format_exc()[
+            -MAX_TOOL_OUTPUT:
+        ]
+
+    finally:
+        if temp_path:
+            try:
+                Path(temp_path).unlink(
+                    missing_ok=True
+                )
+            except Exception:
+                pass
 
 
 TOOLS = [
@@ -163,9 +229,14 @@ TOOLS = [
         "function": {
             "name": "run_python",
             "description": (
-                "Run Python code for downloading, reading, cleaning, analysing "
-                "and calculating results from public datasets. Print all useful "
-                "results because only stdout is returned."
+                "Run Python code for downloading, reading, cleaning, "
+                "analysing, calculating and verifying results from public "
+                "data. Print useful retrieved values, intermediate values "
+                "and final results because only stdout is returned. "
+                "Prefer one filtered or bulk request over many sequential "
+                "requests. Use short HTTP timeouts, normally around 10 to "
+                "15 seconds. If one request fails, change strategy rather "
+                "than repeating the identical request."
             ),
             "parameters": {
                 "type": "object",
@@ -205,7 +276,10 @@ def remove_code_fences(text: str) -> str:
     return cleaned.strip()
 
 
-def first_balanced_json_object(text: str) -> str | None:
+def first_balanced_json_object(
+    text: str,
+) -> str | None:
+
     start = text.find("{")
 
     if start == -1:
@@ -215,14 +289,19 @@ def first_balanced_json_object(text: str) -> str | None:
     inside_string = False
     escaped = False
 
-    for index in range(start, len(text)):
+    for index in range(
+        start,
+        len(text),
+    ):
         character = text[index]
 
         if inside_string:
             if escaped:
                 escaped = False
+
             elif character == "\\":
                 escaped = True
+
             elif character == '"':
                 inside_string = False
 
@@ -238,14 +317,24 @@ def first_balanced_json_object(text: str) -> str | None:
             depth -= 1
 
             if depth == 0:
-                return text[start:index + 1]
+                return text[
+                    start:index + 1
+                ]
 
     return None
 
 
-def normalise_model_reply(raw_reply: str) -> dict[str, Any]:
-    cleaned = remove_code_fences(raw_reply)
-    candidate = first_balanced_json_object(cleaned)
+def normalise_model_reply(
+    raw_reply: str,
+) -> dict[str, Any]:
+
+    cleaned = remove_code_fences(
+        raw_reply
+    )
+
+    candidate = first_balanced_json_object(
+        cleaned
+    )
 
     parsed: Any
 
@@ -255,24 +344,31 @@ def normalise_model_reply(raw_reply: str) -> dict[str, Any]:
         else:
             parsed = json.loads(candidate)
 
-    except (json.JSONDecodeError, TypeError):
+    except (
+        json.JSONDecodeError,
+        TypeError,
+    ):
         parsed = {
-            "answer": cleaned or "Unable to produce an answer"
+            "answer": (
+                cleaned
+                or
+                "Unable to produce an answer"
+            )
         }
 
-    if not isinstance(parsed, dict):
-        parsed = {
-            "answer": parsed
-        }
+    if (
+        isinstance(parsed, dict)
+        and
+        "answer" in parsed
+    ):
+        answer = parsed["answer"]
+    else:
+        answer = parsed
 
-    if "answer" not in parsed:
-        parsed = {
-            "answer": parsed
-        }
-
-    parsed["log_url"] = f"{BASE_URL}/run.jsonl"
-
-    return parsed
+    return {
+        "answer": answer,
+        "log_url": f"{BASE_URL}/run.jsonl",
+    }
 
 
 # -------------------------------------------------------------------
@@ -280,28 +376,122 @@ def normalise_model_reply(raw_reply: str) -> dict[str, Any]:
 # -------------------------------------------------------------------
 
 SYSTEM_PROMPT = """
-You are a careful data-analysis agent responding through Telegram.
+You are a careful autonomous data-analysis agent responding through Telegram.
 
-Rules:
+The grader may ask arbitrary public-data analysis questions.
+Accuracy and completing within the time limit are both critical.
+
+OUTPUT RULES
 
 1. Answer the user's latest message. Earlier messages are context for a
    multi-turn question.
+
 2. Reply with exactly one JSON object and nothing else.
+
 3. The outer JSON must contain exactly:
    - "answer": shaped exactly as the user's question requests
    - "log_url": "LOG_URL_PLACEHOLDER"
-4. Do not add explanations, markdown, code fences or extra keys.
-5. Match requested key names, nesting, lists, strings and numbers exactly.
-6. Use run_python whenever a result can be downloaded, calculated, verified
-   or extracted from a public dataset. Do not guess computable values.
-7. Python may use requests, pandas, numpy, BeautifulSoup and openpyxl.
-8. Print useful values from Python so they are returned to you.
-9. If a public-data download fails, try one reasonable alternative source or
-   method. Do not waste the entire time budget.
-10. If the user sends a setup-only message in a multi-turn conversation,
-    still respond with a small valid JSON acknowledgement, for example:
-    {"answer": "acknowledged", "log_url": "LOG_URL_PLACEHOLDER"}
-11. Never expose API keys, environment variables or private system details.
+
+4. Do not add markdown, explanations, code fences or extra outer keys.
+
+5. Match requested key names, nesting, lists, strings, numbers and output
+   shapes exactly.
+
+ANALYSIS RULES
+
+6. Never guess a value that can reasonably be retrieved or calculated.
+
+7. Use run_python whenever a result can be downloaded, filtered,
+   calculated, compared, ranked, aggregated or verified from public data.
+
+8. Python may use requests, pandas, numpy, BeautifulSoup, openpyxl, lxml,
+   json, csv and standard Python libraries.
+
+9. Always print useful retrieved values, intermediate calculations and the
+   final calculated result so the analysis is auditable.
+
+10. Perform calculations explicitly. For rankings, ratios, differences,
+    percentages, totals or comparisons, calculate every relevant candidate
+    and select the result programmatically.
+
+NETWORK AND DATA RETRIEVAL RULES
+
+11. Prefer one targeted, filtered or bulk request over many sequential
+    requests.
+
+12. Do not make a separate network request for every country, year, row,
+    category or observation when the data can be fetched together.
+
+13. Request only the data needed to answer the question whenever the source
+    supports filtering, field selection, pagination or query parameters.
+
+14. Use HTTP request timeouts of roughly 10 to 15 seconds.
+
+15. If a network request fails or times out once, do not repeat the
+    identical request. Immediately change strategy.
+
+16. A changed strategy can include a smaller query, a bulk endpoint, another
+    API endpoint, another file format, a downloadable dataset, another page
+    from the same organization, or another reliable source when appropriate.
+
+17. Do not create loops that may perform dozens of slow HTTP requests.
+
+18. If an API appears unreliable, prefer downloading the relevant dataset
+    once and processing it locally when practical.
+
+SOURCE ACCURACY RULES
+
+19. When the user explicitly names a source, organization, dataset or
+    indicator, use that source whenever reasonably possible.
+
+20. Do not silently substitute another organization's data when the user
+    explicitly requires a particular source.
+
+21. If one endpoint from the required organization fails, first try another
+    official endpoint, API, download, file or interface from the same
+    organization.
+
+22. Verify dimensions that matter to the question, such as country, year,
+    sex, unit, category, frequency, measure or indicator. Do not blindly
+    take the first matching row.
+
+23. Check naming and identifier differences such as ISO country codes,
+    alternate country names, indicator codes and dimension codes.
+
+24. When using a secondary source because the required source is
+    unavailable, prefer a trustworthy source and avoid inventing missing
+    values.
+
+TIME MANAGEMENT RULES
+
+25. You must produce the final answer comfortably within four minutes.
+
+26. Do not waste the time budget repeatedly querying a broken endpoint.
+
+27. If a tool call times out, immediately use a substantially different
+    strategy.
+
+28. Prefer getting a reliable answer from one or two efficient tool calls
+    over performing many exhaustive attempts.
+
+29. When time is running low, stop making tool calls and return the best
+    answer supported by the evidence already collected.
+
+MULTI-TURN RULES
+
+30. Preserve useful context from earlier messages in the same Telegram chat.
+
+31. Do not blindly reuse earlier numeric results if the new question changes
+    the source, years, indicator, dimensions, filters or calculation.
+
+32. If the user sends a setup-only message, still respond with a small valid
+    JSON acknowledgement, for example:
+    {"answer":"acknowledged","log_url":"LOG_URL_PLACEHOLDER"}
+
+SECURITY RULES
+
+33. Never expose API keys, tokens, environment variables, private system
+    details or secrets.
 """
 
 
@@ -311,7 +501,11 @@ def build_messages(
 ) -> list[dict[str, str]]:
 
     with history_lock:
-        previous = list(chat_histories[chat_id])
+        previous = list(
+            chat_histories[
+                chat_id
+            ]
+        )
 
     return [
         {
@@ -332,9 +526,15 @@ def solve_question(
 ) -> dict[str, Any]:
 
     started_at = time.monotonic()
-    deadline = started_at + QUESTION_TIME_LIMIT
 
-    messages: list[dict[str, Any]] = build_messages(
+    deadline = (
+        started_at
+        + QUESTION_TIME_LIMIT
+    )
+
+    messages: list[
+        dict[str, Any]
+    ] = build_messages(
         chat_id,
         question,
     )
@@ -349,120 +549,244 @@ def solve_question(
 
     final_text = ""
 
-    for step_number in range(1, MAX_AGENT_STEPS + 1):
-        remaining = deadline - time.monotonic()
+    for step_number in range(
+        1,
+        MAX_AGENT_STEPS + 1,
+    ):
 
-        if remaining <= 15:
+        remaining = (
+            deadline
+            - time.monotonic()
+        )
+
+        # Reserve time for final model output.
+        if remaining <= 40:
+
             messages.append(
                 {
                     "role": "system",
                     "content": (
-                        "The time limit is almost reached. Do not call tools. "
-                        "Return your best final JSON answer immediately."
+                        "The time limit is approaching. "
+                        "Do not call tools again. "
+                        "Use the evidence already collected and "
+                        "return the best final JSON answer immediately."
                     ),
                 }
             )
 
-            response = client.chat.completions.create(
-                model=AIPIPE_MODEL,
-                messages=messages,
-            )
+            try:
+                response = (
+                    client.chat.completions.create(
+                        model=AIPIPE_MODEL,
+                        messages=messages,
+                    )
+                )
 
-            final_text = (
-                response.choices[0].message.content or ""
-            )
+                final_text = (
+                    response
+                    .choices[0]
+                    .message
+                    .content
+                    or ""
+                )
+
+            except Exception as error:
+                write_log(
+                    {
+                        "event": "final_model_error",
+                        "chat_id": chat_id,
+                        "error": str(error),
+                    }
+                )
 
             break
 
-        response = client.chat.completions.create(
-            model=AIPIPE_MODEL,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-        )
+        try:
+            response = (
+                client.chat.completions.create(
+                    model=AIPIPE_MODEL,
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                )
+            )
 
-        assistant_message = response.choices[0].message
-
-        assistant_dict = assistant_message.model_dump(
-            exclude_none=True
-        )
-
-        messages.append(assistant_dict)
-
-        tool_calls = assistant_message.tool_calls or []
-
-        if not tool_calls:
-            final_text = assistant_message.content or ""
-            break
-
-        for tool_call in tool_calls:
-            if time.monotonic() >= deadline:
-                break
-
-            if tool_call.function.name != "run_python":
-                tool_output = "Unknown tool requested."
-                tool_code = ""
-
-            else:
-                try:
-                    arguments = json.loads(
-                        tool_call.function.arguments
-                    )
-
-                    tool_code = str(
-                        arguments.get("code", "")
-                    )
-
-                except json.JSONDecodeError:
-                    tool_code = ""
-                    tool_output = "Invalid tool arguments."
-
-                if tool_code:
-                    tool_output = run_python(tool_code)
+        except Exception as error:
 
             write_log(
                 {
-                    "event": "tool_call",
+                    "event": "model_request_error",
                     "chat_id": chat_id,
                     "step": step_number,
-                    "tool": tool_call.function.name,
-                    "code": tool_code,
-                    "output": tool_output,
+                    "error": str(error),
                 }
             )
 
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": tool_output,
-                }
+            continue
+
+        assistant_message = (
+            response
+            .choices[0]
+            .message
+        )
+
+        assistant_dict = (
+            assistant_message.model_dump(
+                exclude_none=True
             )
+        )
+
+        messages.append(
+            assistant_dict
+        )
+
+        tool_calls = (
+            assistant_message.tool_calls
+            or []
+        )
+
+        if not tool_calls:
+            final_text = (
+                assistant_message.content
+                or ""
+            )
+            break
+
+        # Execute only the first tool call from each model step.
+        # This prevents one model response from launching several
+        # potentially slow tool calls.
+        tool_call = tool_calls[0]
+
+        remaining = (
+            deadline
+            - time.monotonic()
+        )
+
+        if remaining <= 40:
+            continue
+
+        tool_code = ""
+        tool_output = ""
+
+        if (
+            tool_call
+            .function
+            .name
+            != "run_python"
+        ):
+            tool_output = (
+                "Unknown tool requested."
+            )
+
+        else:
+            try:
+                arguments = json.loads(
+                    tool_call
+                    .function
+                    .arguments
+                )
+
+                tool_code = str(
+                    arguments.get(
+                        "code",
+                        "",
+                    )
+                )
+
+            except json.JSONDecodeError:
+                tool_output = (
+                    "Invalid tool arguments."
+                )
+
+            if tool_code:
+                tool_output = (
+                    run_python(
+                        tool_code
+                    )
+                )
+
+        write_log(
+            {
+                "event": "tool_call",
+                "chat_id": chat_id,
+                "step": step_number,
+                "tool": (
+                    tool_call
+                    .function
+                    .name
+                ),
+                "code": tool_code,
+                "output": tool_output,
+            }
+        )
+
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": (
+                    tool_call.id
+                ),
+                "content": tool_output,
+            }
+        )
 
     if not final_text:
+
         messages.append(
             {
                 "role": "system",
                 "content": (
-                    "Return your best final answer now as exactly one JSON "
-                    "object. Do not call tools."
+                    "Return the best final answer immediately "
+                    "as exactly one JSON object. "
+                    "Do not call any tools."
                 ),
             }
         )
 
-        response = client.chat.completions.create(
-            model=AIPIPE_MODEL,
-            messages=messages,
-        )
+        try:
+            response = (
+                client.chat.completions.create(
+                    model=AIPIPE_MODEL,
+                    messages=messages,
+                )
+            )
 
-        final_text = (
-            response.choices[0].message.content or ""
-        )
+            final_text = (
+                response
+                .choices[0]
+                .message
+                .content
+                or ""
+            )
 
-    final_reply = normalise_model_reply(final_text)
+        except Exception as error:
+
+            write_log(
+                {
+                    "event": "emergency_final_error",
+                    "chat_id": chat_id,
+                    "error": str(error),
+                }
+            )
+
+            final_text = json.dumps(
+                {
+                    "answer": (
+                        "Unable to complete analysis "
+                        "within the time limit"
+                    )
+                }
+            )
+
+    final_reply = (
+        normalise_model_reply(
+            final_text
+        )
+    )
 
     elapsed = round(
-        time.monotonic() - started_at,
+        time.monotonic()
+        - started_at,
         3,
     )
 
@@ -477,7 +801,12 @@ def solve_question(
     )
 
     with history_lock:
-        history = chat_histories[chat_id]
+
+        history = (
+            chat_histories[
+                chat_id
+            ]
+        )
 
         history.append(
             {
@@ -496,9 +825,11 @@ def solve_question(
             }
         )
 
-        chat_histories[chat_id] = (
-            history[-MAX_HISTORY_MESSAGES:]
-        )
+        chat_histories[
+            chat_id
+        ] = history[
+            -MAX_HISTORY_MESSAGES:
+        ]
 
     return final_reply
 
@@ -595,6 +926,7 @@ def handle_message(
 
 
 def polling_loop() -> None:
+
     offset: int | None = None
 
     write_log(
@@ -604,10 +936,16 @@ def polling_loop() -> None:
     )
 
     while True:
+
         try:
-            payload: dict[str, Any] = {
+            payload: dict[
+                str,
+                Any
+            ] = {
                 "timeout": 50,
-                "allowed_updates": ["message"],
+                "allowed_updates": [
+                    "message"
+                ],
             }
 
             if offset is not None:
@@ -623,25 +961,49 @@ def polling_loop() -> None:
                 "result",
                 [],
             ):
+
                 offset = (
-                    int(update["update_id"]) + 1
+                    int(
+                        update[
+                            "update_id"
+                        ]
+                    )
+                    + 1
                 )
 
                 message = (
-                    update.get("message") or {}
+                    update.get(
+                        "message"
+                    )
+                    or {}
                 )
 
-                text = message.get("text")
+                text = (
+                    message.get(
+                        "text"
+                    )
+                )
 
                 chat = (
-                    message.get("chat") or {}
+                    message.get(
+                        "chat"
+                    )
+                    or {}
                 )
 
-                chat_id = chat.get("id")
+                chat_id = (
+                    chat.get(
+                        "id"
+                    )
+                )
 
                 if (
-                    not isinstance(text, str)
-                    or chat_id is None
+                    not isinstance(
+                        text,
+                        str,
+                    )
+                    or
+                    chat_id is None
                 ):
                     continue
 
@@ -657,6 +1019,7 @@ def polling_loop() -> None:
                 worker.start()
 
         except Exception:
+
             write_log(
                 {
                     "event": "polling_error",
@@ -672,16 +1035,20 @@ def polling_loop() -> None:
 # -------------------------------------------------------------------
 
 def keep_awake_loop() -> None:
+
     while True:
+
         time.sleep(600)
 
-        if not BASE_URL.startswith("http"):
+        if not BASE_URL.startswith(
+            "http"
+        ):
             continue
 
         try:
             requests.get(
                 f"{BASE_URL}/health",
-                timeout=30,
+                timeout=15,
             )
 
         except Exception as error:
